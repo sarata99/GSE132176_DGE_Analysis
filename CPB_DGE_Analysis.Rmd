@@ -27,14 +27,10 @@ pacman::p_load(
 ```
 
 ```{r read-data, message = FALSE}
-# Download geo dataset
-# Force a more robust download method
-options(download.file.method.GEOquery = "libcurl")
-Sys.setenv("VROOM_CONNECTION_SIZE" = 131072 * 10) # Gives the connection more memory
-geo_data <- getGEO("GSE132176", GSEMatrix = TRUE)
-metadata <- pData(geo_data[[1]])
+# Read in geo dataset
+geo_data <- getGEO(filename = "GSE132176_series_matrix.txt.gz")
+metadata <- pData(geo_data)
 
-# Read files
 cel_files <- list.celfiles(path = "GSE132176_RAW", full.names = TRUE)
 file_gsms <- stringr::str_extract(cel_files, "GSM[0-9]+")
 ordered_files <- cel_files[match(metadata$geo_accession, file_gsms)]
@@ -188,6 +184,10 @@ pca_res <- prcomp(t(expression_matrix_filtered), scale. = TRUE)
 pca_df <- as.data.frame(pca_res$x)
 pca_plot_data <- cbind(pca_df, metadata)
 
+pca_res.var <- pca_res$sdev^2
+pca_res.var.per <- round(pca_res.var/sum(pca_res.var)*100,1)
+barplot(pca_res.var.per, main = "Scree Plot", xlab = "Principle Component", ylab = "Percent Variation")
+
 # Create a combined grouping variable for the colors
 pca_plot_data$Disease_Sex <- paste(pca_plot_data$Disease, pca_plot_data$Sex, sep = "_")
 
@@ -240,15 +240,15 @@ ggplot(pca_plot_data, aes(x = PC1, y = PC2, color = ScanDate, shape = Time)) +
 
 year_colors <- c("2013" = "dodgerblue", "2014" = "firebrick")
 
-ggplot(pca_plot_data, aes(x = PC1, y = PC2, color = ScanYear, shape = Time)) +
+ggplot(pca_plot_data, aes(x = PC2, y = PC3, color = ScanYear, shape = Time)) +
   geom_point(size = 4, alpha = 0.8) +
   theme_bw() +
   scale_color_manual(values = year_colors) +
   labs(
     title = "PCA Checking for Batch Effects (Scan Year)",
     subtitle = "Visualizing the temporal confounding effect",
-    x = paste0("PC1 (", round(summary(pca_res)$importance[2,1] * 100, 1), "%)"),
-    y = paste0("PC2 (", round(summary(pca_res)$importance[2,2] * 100, 1), "%)")
+    x = paste0("PC2 (", round(summary(pca_res)$importance[2,2] * 100, 1), "%)"),
+    y = paste0("PC3 (", round(summary(pca_res)$importance[2,3] * 100, 1), "%)")
   )
 
 ```
@@ -256,15 +256,17 @@ ggplot(pca_plot_data, aes(x = PC1, y = PC2, color = ScanYear, shape = Time)) +
 ## Limma DGE
 ``` {r limma-model}
 # Primary grouping factor, ex: TOF_Post_Male
-group <- factor(paste(metadata$Disease, metadata$Time, metadata$Sex, sep = "_"))
-# Set up design matrix
-design <- model.matrix(~0 + group)
-colnames(design) <- levels(group)
+metadata$group <- factor(paste(metadata$Disease, metadata$Time, metadata$Sex, sep = "_"))
+metadata$ScanYear <- as.factor(metadata$ScanYear)
+
+# Set up design matrix, including batch by scan year (2013 or 2014)
+design <- model.matrix(~0 + group + ScanYear, data = metadata)
+colnames(design) <- gsub("group", "", colnames(design))
 
 # duplicateCorrelation estimates the internal consistency of each child's samples
-corfit <- duplicateCorrelation(temp_annotated, design, block = metadata$PatientID)
+corfit <- duplicateCorrelation(expression_matrix_filtered, design, block = metadata$PatientID)
 
-fit <- lmFit(temp_annotated, design, block = metadata$PatientID, correlation = corfit$consensus)
+fit <- lmFit(expression_matrix_filtered, design, block = metadata$PatientID, correlation = corfit$consensus)
 
 # Create contrasts
 contrastMatrix <- makeContrasts(
@@ -283,5 +285,45 @@ fit2 <- eBayes(fit2, robust = TRUE)
 resultsSummary <- decideTests(fit2)
 print(summary(resultsSummary))
 vennDiagram(resultsSummary, cex = c(1, 0.6, 1))
-
 ```
+
+## Post-Analysis and Result Generation
+```{r post-analysis}
+hgnc_complete_set_df <- read_tsv("hgnc_complete_set.txt") %>%
+  dplyr::select(HGNC_Symbol = symbol)
+
+contrasts_list <- colnames(contrastMatrix)
+for (contrast_name in contrasts_list) {
+  res_df <- topTable(fit2, coef = contrast_name, number = Inf, adjust.method = "BH")
+  
+  # Add HGNC gene symbol
+  res_df_with_hgnc <- res_df %>%
+    as_tibble(rownames = "Original_Probe_ID") %>% 
+    mutate(HGNC_Symbol = hgnc_symbols_filtered[match(Original_Probe_ID, names(hgnc_symbols_filtered))])
+  
+  # Remove rows where HGNC_Symbol is NA
+  res_df_with_hgnc <- res_df_with_hgnc %>%
+    filter(!is.na(HGNC_Symbol))
+  
+  # Perform inner_join with the hgnc_complete_set data
+  joined_results <- res_df_with_hgnc %>%
+    inner_join(hgnc_complete_set_df %>% dplyr::select(HGNC_Symbol), by = "HGNC_Symbol")
+  
+  final_results_table <- joined_results %>%
+    dplyr::arrange(adj.P.Val) %>% 
+    dplyr::distinct(HGNC_Symbol, .keep_all = TRUE)
+  
+  final_results_table <- final_results_table %>%
+    dplyr::select(HGNC_Symbol, logFC, adj.P.Val) %>%
+    dplyr::rename(P.value = adj.P.Val)
+  
+  final_results_table <- final_results_table[!is.na(final_results_table$P.value), ]
+  
+  file_name <- paste0("dge_results_", contrast_name, "_final.csv")
+  write_csv(final_results_table, file_name)
+  
+  message(paste("Saved:", file_name))
+}
+```
+
+
