@@ -1,0 +1,287 @@
+---
+title: "Cardiopulmonary Bypass (CPB) Response Analysis in Tetralogy of Fallot (ToF) and Atrial Septal Defect (ASD)"
+author: Sara Tahir
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Project Overview
+This pipeline analyzes the transcriptomic response to cardiopulmonary bypass (CPB) in pediatric patients with Tetralogy of Fallot (ToF) and Atrial Septal Defect (ASD) stratified by sex.
+
+**Platform:** Affymetrix Human Genome U133 Plus PM Array (GSE132176)
+
+**Design:** Paired samples (Pre-CPB and Post-CPB) from the same individuals.
+
+## Setup and Read data
+```{r package-setup, message = FALSE}
+# Load/Install Manager
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(
+  tidyverse, gplots, here,      # CRAN
+  GEOquery, oligo, limma, edgeR, hthgu133pluspm.db # Bioconductor
+)
+```
+
+```{r read-data, message = FALSE}
+# Download geo dataset
+# Force a more robust download method
+options(download.file.method.GEOquery = "libcurl")
+Sys.setenv("VROOM_CONNECTION_SIZE" = 131072 * 10) # Gives the connection more memory
+geo_data <- getGEO("GSE132176", GSEMatrix = TRUE)
+metadata <- pData(geo_data[[1]])
+
+# Read files
+cel_files <- list.celfiles(path = "GSE132176_RAW", full.names = TRUE)
+file_gsms <- stringr::str_extract(cel_files, "GSM[0-9]+")
+ordered_files <- cel_files[match(metadata$geo_accession, file_gsms)]
+raw_data <- read.celfiles(ordered_files)
+```
+
+## Pre-Processing and Normalization
+Use the **Robust Multi-array Average (RMA)** algorithm to perform background subtraction, quantile normalization, and log2 summarization.
+*(Note: Unable to filter based on PA calls (Presence/Absence) because "this is a PM-only array, so MAS5-style P/A calls are not applicable."*
+```{r normalization}
+# Pre-RMA Distribution Check
+boxplot(raw_data, target = "core", main = "Pre-Normalization: Raw Intensities", las = 2, cex.axis = 0.5)
+# Use RMA to do background subtraction, normalization, and summarization
+eset <- rma(raw_data)
+# Get ExpressionFeatureSet
+expression_matrix <- exprs(eset)
+# Post-RMA Distribution Check
+boxplot(expression_matrix, main = "Post-RMA Normalization: Log2 Intensities", las = 2, cex.axis = 0.5)
+```
+
+## Intensity Filtering
+To increase power, drop probes that are mostly just background noise. A density plot of the probe means shows the noise floor is around an instensity of log(10), 3.31
+
+```{r instensity-filtering}
+# Average expression for every probe across all samples
+probe_means <- rowMeans(expression_matrix)
+# Density distribution of averages
+plot(density(probe_means), 
+     main = "Density of Probe Average Intensities", 
+     xlab = "Log2 Intensity (RMA Normalized)")
+# Red line at the log2(10) threshold (3.32)
+abline(v = log2(10), col = "red", lwd = 2, lty = 2)
+keep_intensity <- rowMeans(expression_matrix) > log2(10)
+expression_matrix_filtered <- expression_matrix[keep_intensity, ]
+```
+
+## Annotation of Genes
+``` {r annotate-genes}
+# Label genes
+gene_symbols <- mapIds(hthgu133pluspm.db,
+                      keys = rownames(expression_matrix_filtered),
+                      column = "SYMBOL",
+                      keytype = "PROBEID",
+                      multiVals = "first")
+
+# Filter out probes that don't map to any known gene (NAs)
+valid_probes <- !is.na(gene_symbols)
+expression_matrix_filtered <- expression_matrix_filtered[valid_probes, ]
+hgnc_symbols_filtered <- gene_symbols[valid_probes]
+```
+
+## Transcriptomic Sex Identification
+Metadata in this dataset lacks male/female designation, so to distinguish between males and females the expression of the following genes was analyzed.
+
+Female only: XIST
+
+Male only: KDM5D, RPS4Y1, NLGN4Y, EIF1AY
+```{r sex-determination}
+# Create a temporary collapsed matrix just for the sex calculation math
+temp_annotated <- avereps(expression_matrix_filtered, ID = hgnc_symbols_filtered)
+
+sex_genes <- c("XIST", "KDM5D", "RPS4Y1", "EIF1AY", "NLGN4Y") 
+available_sex_genes <- sex_genes[sex_genes %in% rownames(temp_annotated)]
+
+# Subset matrix to contain just sex genes and transpose so that samples are rows
+sex_matrix <- t(temp_annotated[available_sex_genes, ])
+
+# Heiarchical clustering
+dist_sex <- dist(sex_matrix)
+hclust_sex <- hclust(dist_sex)
+
+plot(hclust_sex, main="Dendrogram: Sex Determination", xlab="Samples", cex=0.5)
+
+heatmap.2(t(sex_matrix), 
+          trace = "none", scale = "row",
+          col = colorRampPalette(c("blue", "white", "red"))(50),
+          main = "Sex Gene Expression Profile")
+
+clusters <- cutree(hclust_sex, k = 2)
+
+# Calculate the mean XIST expression for both clusters
+xist_c1 <- mean(sex_matrix[clusters == 1, "XIST"])
+xist_c2 <- mean(sex_matrix[clusters == 2, "XIST"])
+
+# The cluster with the higher XIST expression is Female
+female_cluster <- ifelse(xist_c1 > xist_c2, 1, 2)
+
+# Build the final sex dataframe for the pipeline
+sexDf <- data.frame(
+  sampleID = rownames(sex_matrix),
+  Cluster = clusters
+) %>%
+  mutate(
+    # Clean up the sample IDs to match metadata
+    sampleID = gsub("^(GSM[0-9]+)_.*$", "\\1", basename(sampleID)),
+    # Assign the text labels
+    transcriptomicSex = ifelse(Cluster == female_cluster, "Female", "Male")
+  )
+```
+
+## Metadata formatting
+```{r metadata-formatting}
+metadata$sampleID <- rownames(metadata)
+
+# Merge sex and create clean factors
+metadata <- metadata %>%
+  left_join(sexDf %>% dplyr::select(sampleID, transcriptomicSex), by = c("geo_accession" = "sampleID")) %>%
+  mutate(
+    Time = factor(ifelse(grepl("before", `time:ch1`), "Pre", "Post"), levels = c("Pre", "Post")),
+    Disease = factor(`disease state:ch1`),
+    PatientID = factor(gsub("patient ", "Pt", `individual:ch1`)), 
+    Sex = factor(transcriptomicSex)
+  )
+
+# Apply clean names (e.g., "TOF_Pre_Male_Pt1")
+clean_sample_names <- paste(metadata$Disease, metadata$Time, metadata$Sex, metadata$PatientID, sep = "_")
+colnames(expression_matrix_filtered) <- clean_sample_names
+rownames(metadata) <- clean_sample_names
+```
+
+## Sample Quality Control
+Used PCA plots and hierarchical clustering. 
+*(Note: Unable to unable to create NUSE/RLE plots because R crashes upon calling fitProbeLevelModel)"*U
+
+``` {r sample-qc}
+# Hierarchical clustering
+dist_mat <- dist(t(expression_matrix_filtered))
+hclust_res <- hclust(dist_mat)
+plot(hclust_res, 
+     main = "Hierarchical Clustering of Samples", 
+     xlab = "Samples", 
+     sub = "", 
+     cex = 0.6) # cex shrinks the text so patient IDs don't overlap as badly
+
+# Heatmap of top variable genes
+# Calculate variance for all genes across all samples
+gene_vars <- apply(expression_matrix_filtered, 1, var)
+# Grab top 500 genes
+top_var_genes <- names(sort(gene_vars, decreasing = TRUE))[1:500]
+
+heatmap.2(expression_matrix_filtered[top_var_genes, ], 
+          trace = "none",         
+          scale = "row",          # Scales the colors per gene (row) so extremes don't wash out the plot
+          col = colorRampPalette(c("blue", "white", "red"))(50),
+          main = "Top 500 Variable Genes",
+          cexCol = 0.6,           
+          margins = c(10, 5)) 
+
+# PCA Plot
+pca_res <- prcomp(t(expression_matrix_filtered), scale. = TRUE)
+pca_df <- as.data.frame(pca_res$x)
+pca_plot_data <- cbind(pca_df, metadata)
+
+# Create a combined grouping variable for the colors
+pca_plot_data$Disease_Sex <- paste(pca_plot_data$Disease, pca_plot_data$Sex, sep = "_")
+
+ggplot(pca_plot_data, aes(x = PC1, y = PC2, color = Disease_Sex, shape = Time)) +
+  geom_point(size = 4, alpha = 0.8) +
+  theme_bw() +
+  
+  # Assign complementary light/dark shades so the diseases group visually
+  scale_color_manual(
+    name = "Disease & Sex",
+    values = c(
+      "ASD_Female" = "orange", 
+      "ASD_Male" = "firebrick", 
+      "TOF_Female" = "deepskyblue", 
+      "TOF_Male" = "darkblue"
+    )
+  ) +
+  
+  labs(
+    title = "PCA of Filtered Expression Data",
+    subtitle = "Single Panel: Disease/Sex (Color) and Time (Shape)",
+    x = paste0("PC1 (", round(summary(pca_res)$importance[2,1] * 100, 1), "%)"),
+    y = paste0("PC2 (", round(summary(pca_res)$importance[2,2] * 100, 1), "%)")
+  )
+```
+
+## Batch Effect Assessment
+Physical scan dates were extracted to assess temporal batch effects.
+```{r batch-effect-check}
+raw_dates <- protocolData(raw_data)$dates
+
+metadata$ScanDate <- as.factor(as.Date(raw_dates, format = "%Y/%m/%d"))
+metadata$ScanYear <- as.factor(format(as.Date(raw_dates, format = "%Y/%m/%d"), "%Y"))
+
+metadata$SampleGroup <- paste(metadata$Disease, metadata$Time, sep = "_")
+table(Group = metadata$SampleGroup, Date = metadata$ScanDate)
+
+pca_plot_data$ScanDate <- metadata$ScanDate
+pca_plot_data$ScanYear <- metadata$ScanYear
+
+ggplot(pca_plot_data, aes(x = PC1, y = PC2, color = ScanDate, shape = Time)) +
+  geom_point(size = 3, alpha = 0.8) +
+  theme_bw() +
+  labs(
+    title = "PCA Checking for Batch Effects (Scan Date)",
+    subtitle = "Shape denotes Pre (Circle) vs Post (Triangle)",
+    x = paste0("PC1 (", round(summary(pca_res)$importance[2,1] * 100, 1), "%)"),
+    y = paste0("PC2 (", round(summary(pca_res)$importance[2,2] * 100, 1), "%)")
+  )
+
+year_colors <- c("2013" = "dodgerblue", "2014" = "firebrick")
+
+ggplot(pca_plot_data, aes(x = PC1, y = PC2, color = ScanYear, shape = Time)) +
+  geom_point(size = 4, alpha = 0.8) +
+  theme_bw() +
+  scale_color_manual(values = year_colors) +
+  labs(
+    title = "PCA Checking for Batch Effects (Scan Year)",
+    subtitle = "Visualizing the temporal confounding effect",
+    x = paste0("PC1 (", round(summary(pca_res)$importance[2,1] * 100, 1), "%)"),
+    y = paste0("PC2 (", round(summary(pca_res)$importance[2,2] * 100, 1), "%)")
+  )
+
+```
+
+## Limma DGE
+``` {r limma-model}
+# Primary grouping factor, ex: TOF_Post_Male
+group <- factor(paste(metadata$Disease, metadata$Time, metadata$Sex, sep = "_"))
+# Set up design matrix
+design <- model.matrix(~0 + group)
+colnames(design) <- levels(group)
+
+# duplicateCorrelation estimates the internal consistency of each child's samples
+corfit <- duplicateCorrelation(temp_annotated, design, block = metadata$PatientID)
+
+fit <- lmFit(temp_annotated, design, block = metadata$PatientID, correlation = corfit$consensus)
+
+# Create contrasts
+contrastMatrix <- makeContrasts(
+  TOF_Male_Response = TOF_Post_Male - TOF_Pre_Male,
+  TOF_Female_Response = TOF_Post_Female - TOF_Pre_Female,
+  ASD_Male_Response = ASD_Post_Male - ASD_Pre_Male,
+  ASD_Female_Response = ASD_Post_Female - ASD_Pre_Female,
+  levels = design
+)
+
+# Final Statistics
+fit2 <- contrasts.fit(fit, contrastMatrix)
+fit2 <- eBayes(fit2, robust = TRUE)
+
+# View Summaries
+resultsSummary <- decideTests(fit2)
+print(summary(resultsSummary))
+vennDiagram(resultsSummary, cex = c(1, 0.6, 1))
+
+```
