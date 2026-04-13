@@ -376,12 +376,9 @@ colnames(design) <- gsub("group", "", colnames(design))
 
 aw <- arrayWeights(expression_matrix_filtered, design)
 
+# Plot arrayWeights
 names(aw) <- colnames(expression_matrix_filtered)
-
-# 1. Expand the bottom margin of the plot window so long names fit
 par(mar = c(12, 4, 4, 2)) 
-
-# 2. Plot the weights, highlighting Pt4 in red
 barplot(aw, 
         las = 2, 
         names.arg = names(aw), # FIX: Force the plot to use the names
@@ -389,16 +386,13 @@ barplot(aw,
         main = "Limma Array Weights: Sample Quality",
         ylab = "Relative Weight (1.0 is average)",
         cex.names = 0.8) 
-
 abline(h = 1, col = "red", lty = 2)
-
-# 3. Reset the plot margins back to default 
 par(mar = c(5, 4, 4, 2) + 0.1)
 
 # duplicateCorrelation estimates the internal consistency of each child's samples
 corfit <- duplicateCorrelation(expression_matrix_filtered, design, block = metadata$PatientID)
 
-fit <- lmFit(expression_matrix_filtered, design, block = metadata$PatientID, correlation = corfit$consensus)
+fit <- lmFit(expression_matrix_filtered, design, block = metadata$PatientID, correlation = corfit$consensus, weights = aw)
 
 # Create contrasts
 contrastMatrix <- makeContrasts(
