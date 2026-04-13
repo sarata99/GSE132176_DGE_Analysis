@@ -22,7 +22,7 @@ This pipeline analyzes the transcriptomic response to cardiopulmonary bypass (CP
 if (!require("pacman")) install.packages("pacman")
 pacman::p_load(
   tidyverse, gplots, here,      # CRAN
-  GEOquery, oligo, limma, edgeR, hthgu133pluspm.db # Bioconductor
+  GEOquery, oligo, limma, edgeR, hthgu133pluspm.db, sva # Bioconductor
 )
 ```
 
@@ -55,16 +55,58 @@ boxplot(expression_matrix, main = "Post-RMA Normalization: Log2 Intensities", la
 To increase power, drop probes that are mostly just background noise. A density plot of the probe means shows the noise floor is around an instensity of log(10), 3.31
 
 ```{r instensity-filtering}
-# Average expression for every probe across all samples
-probe_means <- rowMeans(expression_matrix)
-# Density distribution of averages
-plot(density(probe_means), 
-     main = "Density of Probe Average Intensities", 
-     xlab = "Log2 Intensity (RMA Normalized)")
-# Red line at the log2(10) threshold (3.32)
-abline(v = log2(10), col = "red", lwd = 2, lty = 2)
-keep_intensity <- rowMeans(expression_matrix) > log2(10)
-expression_matrix_filtered <- expression_matrix[keep_intensity, ]
+min_samples <- 4 # ASD males have a group size of 4
+
+noise_threshold <- median(expression_matrix) # Can also use log(10) value
+is_expressed <- expression_matrix > noise_threshold
+keep_probes <- rowSums(is_expressed) >= min_samples
+
+expression_matrix_filtered <- expression_matrix[keep_probes, ]
+
+# Check how many probes were removed
+total_probes <- nrow(expression_matrix)
+kept_probes <- nrow(expression_matrix_filtered)
+removed_probes <- total_probes - kept_probes
+
+cat("Total starting probes:", total_probes, "\n")
+cat("Probes kept:", kept_probes, paste0("(", round((kept_probes/total_probes)*100, 1), "%)"), "\n")
+cat("Probes removed (Noise):", removed_probes, paste0("(", round((removed_probes/total_probes)*100, 1), "%)"), "\n")
+
+# Create plot to view data before and after filtering
+pre_filter_means <- rowMeans(expression_matrix)
+post_filter_means <- rowMeans(expression_matrix_filtered)
+
+plot(density(pre_filter_means), 
+     main = "Effect of Filtering on Probe Density", 
+     xlab = "Log2 Intensity (RMA Normalized)", 
+     col = "black", 
+     lwd = 2,
+     ylim = c(0, max(density(pre_filter_means)$y) * 1.2)) # Gives a little headroom
+
+lines(density(post_filter_means), col = "red", lwd = 2)
+
+legend("topright", 
+       legend = c("Pre-Filter (All Probes)", "Post-Filter (Kept Probes)"), 
+       fill = c("black", "red"))
+
+# Calculate Mean and Standard Deviation for all original probes
+pre_mean <- rowMeans(expression_matrix)
+pre_sd <- apply(expression_matrix, 1, sd)
+
+# Plot Mean vs Variance (Pre-Filter)
+plot(pre_mean, pre_sd, 
+     pch = 16, cex = 0.5, col = rgb(0,0,0,0.1), # Transparent black dots
+     main = "Mean-Variance Trend", 
+     xlab = "Average Log2 Expression", 
+     ylab = "Standard Deviation")
+
+# Highlight the kept probes in blue on top
+points(pre_mean[keep_probes], pre_sd[keep_probes], 
+       pch = 16, cex = 0.5, col = rgb(0,0,1,0.1)) # Transparent blue dots
+
+legend("topright", legend=c("Discarded Noise", "Kept Probes"), 
+       col=c("black", "blue"), pch=16)
+
 ```
 
 ## Annotation of Genes
@@ -152,7 +194,7 @@ rownames(metadata) <- clean_sample_names
 ```
 
 ## Sample Quality Control
-Used PCA plots and hierarchical clustering. 
+Used hierarchical clustering and PCA plots
 *(Note: Unable to unable to create NUSE/RLE plots because R crashes upon calling fitProbeLevelModel)"*U
 
 ``` {r sample-qc}
@@ -166,6 +208,7 @@ plot(hclust_res,
      cex = 0.6) # cex shrinks the text so patient IDs don't overlap as badly
 
 # Heatmap of top variable genes
+# Outlier Detection (e.g., Cook's Distance from limma):
 # Calculate variance for all genes across all samples
 gene_vars <- apply(expression_matrix_filtered, 1, var)
 # Grab top 500 genes
@@ -233,22 +276,90 @@ ggplot(pca_plot_data, aes(x = PC1, y = PC2, color = ScanDate, shape = Time)) +
   theme_bw() +
   labs(
     title = "PCA Checking for Batch Effects (Scan Date)",
-    subtitle = "Shape denotes Pre (Circle) vs Post (Triangle)",
     x = paste0("PC1 (", round(summary(pca_res)$importance[2,1] * 100, 1), "%)"),
     y = paste0("PC2 (", round(summary(pca_res)$importance[2,2] * 100, 1), "%)")
   )
 
 year_colors <- c("2013" = "dodgerblue", "2014" = "firebrick")
 
-ggplot(pca_plot_data, aes(x = PC2, y = PC3, color = ScanYear, shape = Time)) +
+ggplot(pca_plot_data, aes(x = PC1, y = PC2, color = ScanYear, shape = Time)) +
   geom_point(size = 4, alpha = 0.8) +
   theme_bw() +
   scale_color_manual(values = year_colors) +
   labs(
     title = "PCA Checking for Batch Effects (Scan Year)",
-    subtitle = "Visualizing the temporal confounding effect",
-    x = paste0("PC2 (", round(summary(pca_res)$importance[2,2] * 100, 1), "%)"),
-    y = paste0("PC3 (", round(summary(pca_res)$importance[2,3] * 100, 1), "%)")
+    x = paste0("PC1 (", round(summary(pca_res)$importance[2,1] * 100, 1), "%)"),
+    y = paste0("PC2 (", round(summary(pca_res)$importance[2,2] * 100, 1), "%)")
+  )
+```
+## Batch Effect Correction
+```{r batch-effect-correction}
+metadata$group <- factor(paste(metadata$Disease, metadata$Time, metadata$Sex, sep = "_"))
+mod <- model.matrix(~ group, data = metadata)
+
+expression_matrix_filtered <- ComBat(
+  dat = expression_matrix_filtered, 
+  batch = metadata$ScanYear, 
+  mod = mod, 
+  par.prior = TRUE
+)
+
+# Re-calculate PCA on the newly scrubbed ComBat matrix
+pca_res_post <- prcomp(t(expression_matrix_filtered), scale. = TRUE)
+pca_df_post <- as.data.frame(pca_res_post$x)
+pca_plot_data_post <- cbind(pca_df_post, metadata)
+
+# Define the batch colors again
+year_colors <- c("2013" = "dodgerblue", "2014" = "firebrick")
+
+# Generate the plot
+ggplot(pca_plot_data_post, aes(x = PC1, y = PC2, color = ScanYear, shape = Time)) +
+  geom_point(size = 4, alpha = 0.8) +
+  theme_bw() +
+  scale_color_manual(values = year_colors) +
+  labs(
+    title = "Post-ComBat PCA: Batch Effect Assessment",
+    x = paste0("PC1 (", round(summary(pca_res_post)$importance[2,1] * 100, 1), "%)"),
+    y = paste0("PC2 (", round(summary(pca_res_post)$importance[2,2] * 100, 1), "%)")
+  )
+
+# Combined plot
+pca_res_final <- prcomp(t(expression_matrix_filtered), scale. = TRUE)
+pca_df_final <- as.data.frame(pca_res_final$x)
+
+# Bind with metadata
+pca_plot_data_final <- cbind(pca_df_final, metadata)
+pca_res.var_final <- pca_res_final$sdev^2
+pca_res.var.per_final <- round(pca_res.var_final/sum(pca_res.var_final)*100, 1)
+
+barplot(pca_res.var.per_final, 
+        main = "Post-ComBat Scree Plot", 
+        xlab = "Principal Component", 
+        ylab = "Percent Variation",
+        col = "steelblue")
+
+pca_plot_data_final$Disease_Sex <- paste(pca_plot_data_final$Disease, pca_plot_data_final$Sex, sep = "_")
+
+ggplot(pca_plot_data_final, aes(x = PC1, y = PC2, color = Disease_Sex, shape = Time)) +
+  geom_point(size = 4, alpha = 0.8) +
+  theme_bw() +
+  
+  # Keep your complementary light/dark shades
+  scale_color_manual(
+    name = "Disease & Sex",
+    values = c(
+      "ASD_Female" = "orange", 
+      "ASD_Male" = "firebrick", 
+      "TOF_Female" = "deepskyblue", 
+      "TOF_Male" = "darkblue"
+    )
+  ) +
+  
+  labs(
+    title = "Post-ComBat PCA: Disease, Sex, and CPB Response",
+    subtitle = "Shape denotes Pre (Circle) vs Post (Triangle)",
+    x = paste0("PC1 (", round(summary(pca_res_final)$importance[2,1] * 100, 1), "%)"),
+    y = paste0("PC2 (", round(summary(pca_res_final)$importance[2,2] * 100, 1), "%)")
   )
 
 ```
@@ -257,10 +368,9 @@ ggplot(pca_plot_data, aes(x = PC2, y = PC3, color = ScanYear, shape = Time)) +
 ``` {r limma-model}
 # Primary grouping factor, ex: TOF_Post_Male
 metadata$group <- factor(paste(metadata$Disease, metadata$Time, metadata$Sex, sep = "_"))
-metadata$ScanYear <- as.factor(metadata$ScanYear)
 
-# Set up design matrix, including batch by scan year (2013 or 2014)
-design <- model.matrix(~0 + group + ScanYear, data = metadata)
+# Set up design matrix
+design <- model.matrix(~0 + group, data = metadata)
 colnames(design) <- gsub("group", "", colnames(design))
 
 # duplicateCorrelation estimates the internal consistency of each child's samples
@@ -274,6 +384,11 @@ contrastMatrix <- makeContrasts(
   TOF_Female_Response = TOF_Post_Female - TOF_Pre_Female,
   ASD_Male_Response = ASD_Post_Male - ASD_Pre_Male,
   ASD_Female_Response = ASD_Post_Female - ASD_Pre_Female,
+  
+  # Sex diff
+  TOF_Sex_Diff = (TOF_Post_Female - TOF_Pre_Female) - (TOF_Post_Male - TOF_Pre_Male),
+  ASD_Sex_Diff = (ASD_Post_Female - ASD_Pre_Female) - (ASD_Post_Male - ASD_Pre_Male),
+  
   levels = design
 )
 
@@ -284,7 +399,13 @@ fit2 <- eBayes(fit2, robust = TRUE)
 # View Summaries
 resultsSummary <- decideTests(fit2)
 print(summary(resultsSummary))
-vennDiagram(resultsSummary, cex = c(1, 0.6, 1))
+# Venn Diagram for TOF Cohort
+vennDiagram(resultsSummary[, c("TOF_Male_Response", "TOF_Female_Response", "ASD_Male_Response", "ASD_Female_Response")],)
+
+# Venn Diagram for ASD Cohort
+vennDiagram(resultsSummary[, c("ASD_Male_Response", "ASD_Female_Response")], 
+            main = "ASD Response to CPB: Male vs Female", 
+            circle.col = c("firebrick", "orange"))
 ```
 
 ## Post-Analysis and Result Generation
@@ -314,10 +435,9 @@ for (contrast_name in contrasts_list) {
     dplyr::distinct(HGNC_Symbol, .keep_all = TRUE)
   
   final_results_table <- final_results_table %>%
-    dplyr::select(HGNC_Symbol, logFC, adj.P.Val) %>%
-    dplyr::rename(P.value = adj.P.Val)
+    dplyr::select(HGNC_Symbol, logFC, P.Value, adj.P.Val)
   
-  final_results_table <- final_results_table[!is.na(final_results_table$P.value), ]
+  final_results_table <- final_results_table[!is.na(final_results_table$adj.P.Val), ]
   
   file_name <- paste0("dge_results_", contrast_name, "_final.csv")
   write_csv(final_results_table, file_name)
@@ -325,5 +445,3 @@ for (contrast_name in contrasts_list) {
   message(paste("Saved:", file_name))
 }
 ```
-
-
