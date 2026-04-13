@@ -52,10 +52,10 @@ boxplot(expression_matrix, main = "Post-RMA Normalization: Log2 Intensities", la
 ```
 
 ## Intensity Filtering
-To increase power, drop probes that are mostly just background noise. A density plot of the probe means shows the noise floor is around an instensity of log(10), 3.31
+To increase power, drop probes that are mostly just background noise. Filter by expression cannot be used because this is microarray data, so instead check to make sure a gene is expressed above the noise in at least n patients, n being the smallest group size
 
 ```{r instensity-filtering}
-min_samples <- 4 # ASD males have a group size of 4
+min_samples <- 4 # ASD males are the smallest group size
 
 noise_threshold <- median(expression_matrix) # Can also use log(10) value
 is_expressed <- expression_matrix > noise_threshold
@@ -89,24 +89,22 @@ legend("topright",
        legend = c("Pre-Filter (All Probes)", "Post-Filter (Kept Probes)"), 
        fill = c("black", "red"))
 
-# Calculate Mean and Standard Deviation for all original probes
+# Plot Mean vs Variance
 pre_mean <- rowMeans(expression_matrix)
 pre_sd <- apply(expression_matrix, 1, sd)
 
-# Plot Mean vs Variance (Pre-Filter)
 plot(pre_mean, pre_sd, 
      pch = 16, cex = 0.5, col = rgb(0,0,0,0.1), # Transparent black dots
      main = "Mean-Variance Trend", 
      xlab = "Average Log2 Expression", 
      ylab = "Standard Deviation")
 
-# Highlight the kept probes in blue on top
+# Highlight the kept probes in blue
 points(pre_mean[keep_probes], pre_sd[keep_probes], 
-       pch = 16, cex = 0.5, col = rgb(0,0,1,0.1)) # Transparent blue dots
+       pch = 16, cex = 0.5, col = rgb(0,0,1,0.1))
 
 legend("topright", legend=c("Discarded Noise", "Kept Probes"), 
        col=c("black", "blue"), pch=16)
-
 ```
 
 ## Annotation of Genes
@@ -140,7 +138,7 @@ available_sex_genes <- sex_genes[sex_genes %in% rownames(temp_annotated)]
 # Subset matrix to contain just sex genes and transpose so that samples are rows
 sex_matrix <- t(temp_annotated[available_sex_genes, ])
 
-# Heiarchical clustering
+# Hierarchical clustering
 dist_sex <- dist(sex_matrix)
 hclust_sex <- hclust(dist_sex)
 
@@ -191,6 +189,12 @@ metadata <- metadata %>%
 clean_sample_names <- paste(metadata$Disease, metadata$Time, metadata$Sex, metadata$PatientID, sep = "_")
 colnames(expression_matrix_filtered) <- clean_sample_names
 rownames(metadata) <- clean_sample_names
+
+# Add scan dates and scan years to metadata
+raw_dates <- protocolData(raw_data)$dates
+metadata$ScanDate <- as.factor(as.Date(raw_dates, format = "%Y/%m/%d"))
+metadata$ScanYear <- as.factor(format(as.Date(raw_dates, format = "%Y/%m/%d"), "%Y"))
+metadata$SampleGroup <- paste(metadata$Disease, metadata$Time, sep = "_")
 ```
 
 ## Sample Quality Control
@@ -208,7 +212,6 @@ plot(hclust_res,
      cex = 0.6) # cex shrinks the text so patient IDs don't overlap as badly
 
 # Heatmap of top variable genes
-# Outlier Detection (e.g., Cook's Distance from limma):
 # Calculate variance for all genes across all samples
 gene_vars <- apply(expression_matrix_filtered, 1, var)
 # Grab top 500 genes
@@ -261,12 +264,6 @@ ggplot(pca_plot_data, aes(x = PC1, y = PC2, color = Disease_Sex, shape = Time)) 
 ## Batch Effect Assessment
 Physical scan dates were extracted to assess temporal batch effects.
 ```{r batch-effect-check}
-raw_dates <- protocolData(raw_data)$dates
-
-metadata$ScanDate <- as.factor(as.Date(raw_dates, format = "%Y/%m/%d"))
-metadata$ScanYear <- as.factor(format(as.Date(raw_dates, format = "%Y/%m/%d"), "%Y"))
-
-metadata$SampleGroup <- paste(metadata$Disease, metadata$Time, sep = "_")
 table(Group = metadata$SampleGroup, Date = metadata$ScanDate)
 
 pca_plot_data$ScanDate <- metadata$ScanDate
@@ -345,7 +342,6 @@ ggplot(pca_plot_data_final, aes(x = PC1, y = PC2, color = Disease_Sex, shape = T
   geom_point(size = 4, alpha = 0.8) +
   theme_bw() +
   
-  # Keep your complementary light/dark shades
   scale_color_manual(
     name = "Disease & Sex",
     values = c(
@@ -358,7 +354,6 @@ ggplot(pca_plot_data_final, aes(x = PC1, y = PC2, color = Disease_Sex, shape = T
   
   labs(
     title = "Post-ComBat PCA: Disease, Sex, and CPB Response",
-    subtitle = "Shape denotes Pre (Circle) vs Post (Triangle)",
     x = paste0("PC1 (", round(summary(pca_res_final)$importance[2,1] * 100, 1), "%)"),
     y = paste0("PC2 (", round(summary(pca_res_final)$importance[2,2] * 100, 1), "%)")
   )
@@ -408,15 +403,13 @@ contrastMatrix <- makeContrasts(
   levels = design
 )
 
-# Final Statistics
 fit2 <- contrasts.fit(fit, contrastMatrix)
 fit2 <- eBayes(fit2, robust = TRUE)
 
 # View Summaries
 resultsSummary <- decideTests(fit2)
 print(summary(resultsSummary))
-# Venn Diagram for TOF Cohort
-vennDiagram(resultsSummary[, c("TOF_Male_Response", "TOF_Female_Response", "ASD_Male_Response", "ASD_Female_Response")],)
+vennDiagram(resultsSummary[, c("TOF_Male_Response", "TOF_Female_Response", "ASD_Male_Response", "ASD_Female_Response")])
 ```
 
 ## Post-Analysis and Result Generation
@@ -455,4 +448,59 @@ for (contrast_name in contrasts_list) {
   
   message(paste("Saved:", file_name))
 }
+```
+## Post Analysis QC
+Calculate Cook's distances, compared model with and without weights to ensure weights have the intended effect.
+``` {r cooks-distance}
+
+# Unweighted fit
+fit_unweighted <- lmFit(expression_matrix_filtered, design, 
+                        block = metadata$PatientID, 
+                        correlation = corfit$consensus)
+
+# Calculate Leverages (Hat Matrix)
+# Since the design matrix is the same for both, leverage is constant
+hat_matrix <- design %*% solve(t(design) %*% design) %*% t(design)
+leverages <- diag(hat_matrix)
+p <- ncol(design)
+
+# Extract Residuals for both weighted and unweighted models
+resids_un <- residuals(fit_unweighted, expression_matrix_filtered)
+resids_wt <- residuals(fit, expression_matrix_filtered)
+
+# Calculate Cook's Distance Matrix unweighted 
+cooks_un <- sweep(resids_un^2, 1, (p * fit$sigma^2), "/")
+cooks_un <- sweep(cooks_un, 2, (leverages / (1 - leverages)^2), "*")
+mean_cooks_un <- colMeans(cooks_un, na.rm = TRUE)
+
+# Calculate Cook's Distance Matrix weighted
+cooks_wt <- sweep(resids_wt^2, 1, (p * fit$sigma^2), "/")
+# The residual is scaled by the weight of the array
+cooks_wt <- sweep(cooks_wt, 2, (leverages / (1 - leverages)^2) * aw, "*")
+mean_cooks_wt <- colMeans(cooks_wt, na.rm = TRUE)
+
+# Set up a 1x2 plotting grid and expand the bottom margins
+par(mfrow = c(1, 2), mar = c(12, 4, 4, 2)) 
+threshold <- 4 / ncol(expression_matrix_filtered) # 4/n threshold
+
+# Unweighted
+barplot(mean_cooks_un, 
+        las = 2, 
+        main = "Before: Unweighted Model",
+        ylab = "Mean Cook's Distance",
+        col = ifelse(names(mean_cooks_un) == "ASD_Pre_Female_Pt4", "firebrick", "gray80"),
+        cex.names = 0.6)
+abline(h = threshold, col = "red", lty = 2, lwd = 2)
+
+# Weighted
+barplot(mean_cooks_wt, 
+        las = 2, 
+        main = "After: ArrayWeights Applied",
+        ylab = "Mean Cook's Distance",
+        col = ifelse(names(mean_cooks_wt) == "ASD_Pre_Female_Pt4", "firebrick", "steelblue"),
+        cex.names = 0.6)
+abline(h = threshold, col = "red", lty = 2, lwd = 2)
+
+# Reset plotting parameters
+par(mfrow = c(1, 1), mar = c(5, 4, 4, 2) + 0.1)
 ```
