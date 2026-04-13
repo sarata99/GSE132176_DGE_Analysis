@@ -236,6 +236,7 @@ pca_plot_data$Disease_Sex <- paste(pca_plot_data$Disease, pca_plot_data$Sex, sep
 
 ggplot(pca_plot_data, aes(x = PC1, y = PC2, color = Disease_Sex, shape = Time)) +
   geom_point(size = 4, alpha = 0.8) +
+  geom_text(aes(label = PatientID), vjust = 2, size = 3, show.legend = FALSE) +
   theme_bw() +
   
   # Assign complementary light/dark shades so the diseases group visually
@@ -373,6 +374,27 @@ metadata$group <- factor(paste(metadata$Disease, metadata$Time, metadata$Sex, se
 design <- model.matrix(~0 + group, data = metadata)
 colnames(design) <- gsub("group", "", colnames(design))
 
+aw <- arrayWeights(expression_matrix_filtered, design)
+
+names(aw) <- colnames(expression_matrix_filtered)
+
+# 1. Expand the bottom margin of the plot window so long names fit
+par(mar = c(12, 4, 4, 2)) 
+
+# 2. Plot the weights, highlighting Pt4 in red
+barplot(aw, 
+        las = 2, 
+        names.arg = names(aw), # FIX: Force the plot to use the names
+        col = ifelse(grepl("ASD_Pre_Female_Pt4", names(aw)), "firebrick", "steelblue"),
+        main = "Limma Array Weights: Sample Quality",
+        ylab = "Relative Weight (1.0 is average)",
+        cex.names = 0.8) 
+
+abline(h = 1, col = "red", lty = 2)
+
+# 3. Reset the plot margins back to default 
+par(mar = c(5, 4, 4, 2) + 0.1)
+
 # duplicateCorrelation estimates the internal consistency of each child's samples
 corfit <- duplicateCorrelation(expression_matrix_filtered, design, block = metadata$PatientID)
 
@@ -401,11 +423,6 @@ resultsSummary <- decideTests(fit2)
 print(summary(resultsSummary))
 # Venn Diagram for TOF Cohort
 vennDiagram(resultsSummary[, c("TOF_Male_Response", "TOF_Female_Response", "ASD_Male_Response", "ASD_Female_Response")],)
-
-# Venn Diagram for ASD Cohort
-vennDiagram(resultsSummary[, c("ASD_Male_Response", "ASD_Female_Response")], 
-            main = "ASD Response to CPB: Male vs Female", 
-            circle.col = c("firebrick", "orange"))
 ```
 
 ## Post-Analysis and Result Generation
